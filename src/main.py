@@ -1,29 +1,66 @@
-import osmnx as ox
-import geopandas as gpd
+print("=== NEW MAIN.PY IS RUNNING ===")
 import folium
+import osmnx as ox
 
+from recommendation import recommend_locations
+
+# -----------------------------
+# Load Road Network
+# -----------------------------
 city = "Chennai, Tamil Nadu, India"
-graph = ox.graph_from_place(
-    city,
-    network_type="drive"
-)
-print(graph)
 
+print("Loading road network...")
+
+graph = ox.graph_from_place(city, network_type="drive")
 nodes, edges = ox.graph_to_gdfs(graph)
-print(nodes.head())
-print(edges.head())
 
-# Create a map centered on Chennai
+# -----------------------------
+# Load Existing Charging Stations
+# -----------------------------
+print("Loading charging stations...")
+
+tags = {"amenity": "charging_station"}
+stations = ox.features_from_place(city, tags)
+
+# -----------------------------
+# Run Recommendation Model
+# -----------------------------
+print("Running clustering...")
+
+clustered_data, centers = recommend_locations(
+    "data/sample_locations.csv"
+)
+
+# -----------------------------
+# Create Map
+# -----------------------------
 m = folium.Map(
     location=[13.0827, 80.2707],
     zoom_start=11
 )
 
-folium.GeoJson(
-    edges.to_json(),
-    name="Road Network"
-).add_to(m)
+# Roads
+folium.GeoJson(edges.to_json()).add_to(m)
 
-# Save the map to an HTML file
-m.save("outputs/chennai_map.html")
-print("Map saved successfully!")
+# Existing Charging Stations
+for _, row in stations.iterrows():
+    point = row.geometry
+
+    folium.Marker(
+        [point.y, point.x],
+        popup=row.get("name", "Charging Station"),
+        icon=folium.Icon(color="green", icon="bolt", prefix="fa")
+    ).add_to(m)
+
+# Recommended Locations (Cluster Centers)
+for center in centers:
+    folium.Marker(
+        [center[0], center[1]],
+        popup="Recommended Location",
+        icon=folium.Icon(color="red", icon="star")
+    ).add_to(m)
+
+# Save map
+m.save("outputs/final_map.html")
+
+print("Project completed successfully!")
