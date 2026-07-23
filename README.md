@@ -166,9 +166,3 @@ Each recommended location includes:
 
 ---
 
-## 👨‍💻 Author
-
-**Koushal Edupulapati**
-
-B.Tech Artificial Intelligence & Machine Learning
-SRM Institute of Science and Technology
