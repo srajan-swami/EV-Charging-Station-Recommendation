@@ -31,6 +31,12 @@ clustered_data, centers = recommend_locations(
     "data/sample_locations.csv"
 )
 
+# Save ranked recommendations for visualization
+clustered_data.to_csv(
+    "outputs/recommendations.csv",
+    index=False
+)
+
 # -----------------------------
 # Create Map
 # -----------------------------
@@ -52,15 +58,35 @@ for _, row in stations.iterrows():
         icon=folium.Icon(color="green", icon="bolt", prefix="fa")
     ).add_to(m)
 
-# Recommended Locations (Cluster Centers)
-for center in centers:
+NUM_RECOMMENDATIONS = 75
+# Top Recommended Locations
+for _, row in clustered_data.head(NUM_RECOMMENDATIONS).iterrows():
+    score = row["RecommendationScore"]
+
+    color = "red"
+
+    popup = folium.Popup(
+        f"""
+        <b>⚡ EV Charging Recommendation</b><br><br>
+        <b>Rank:</b> {int(row['Rank'])}<br>
+        <b>Recommendation Score:</b> {score:.2f}<br><br>
+        <b>Why Recommended?</b><br>
+        {row['Recommendation']}
+        """,
+        max_width=320,
+    )
+
     folium.Marker(
-        [center[0], center[1]],
-        popup="Recommended Location",
-        icon=folium.Icon(color="red", icon="star")
+        [row["latitude"], row["longitude"]],
+        popup=popup,
+        icon=folium.Icon(color="red", icon="bolt", prefix="fa")
     ).add_to(m)
 
 # Save map
 m.save("outputs/final_map.html")
 
+print(f"Total Candidate Locations : {len(clustered_data)}")
+print(f"Top Recommendations Shown : {min(NUM_RECOMMENDATIONS, len(clustered_data))}")
+print("Recommendations saved to outputs/recommendations.csv")
+print("Interactive map saved to outputs/final_map.html")
 print("Project completed successfully!")
