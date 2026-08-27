@@ -1,0 +1,24 @@
+# ChargeSense — pinned dependencies
+# Python 3.12 or 3.13. Pick ONE version across the team: committed .pyc files
+# currently show both cpython-313 and cpython-314, which is a live source of
+# "works on my machine".
+
+osmnx==2.1.1
+geopandas>=1.0
+shapely>=2.0
+networkx>=3.0
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+folium>=0.15
+pyproj>=3.5
+
+# Dashboard
+streamlit>=1.30
+
+# Address resolution. Optional — without it every address shows
+# "Address unavailable" and nothing else breaks.
+geopy>=2.4
+
+# Tests
+pytest>=7.0

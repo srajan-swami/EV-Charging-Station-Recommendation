@@ -1,258 +1,230 @@
-import pandas as pd
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.neighbors import BallTree
-import osmnx as ox
+"""
+ChargeSense — recommendation engine.
+
+The engine is split into an expensive half and a cheap half, and the split is
+the point:
+
+    build_scored_table(city)      slow — downloads, features, feasibility.
+                                  Runs once per city, then cached.
+
+    select_recommendations(...)   fast — applies weights, filters, ranks.
+                                  Runs every time a slider moves.
+
+Because weights are only ever applied in the cheap half, changing a weight
+never triggers a download. This is what makes the dashboard usable.
+
+Both Folium and Streamlit call these same two functions. The scoring algorithm
+exists in exactly one place.
+"""
+
+from __future__ import annotations
+
+import logging
+
 import numpy as np
+import pandas as pd
+
+from config import (
+    DEFAULT_CITY,
+    DEFAULT_N_CLUSTERS,
+    DEFAULT_N_RECOMMENDATIONS,
+    DEFAULT_WEIGHTS,
+    FEASIBILITY_REJECT_BELOW,
+    MIN_DISTANCE_FROM_STATION_KM,
+    MIN_RECOMMENDATION_SPACING_KM,
+    city_dir,
+)
+
+import candidate_locations
+import feasibility as feasibility_mod
+from clustering import cluster_candidates
+from explainability import explain_frame
+from feature_engineering import build_features
+from geo import select_spaced
+from landmarks import primary_landmark
+from scoring import compute_dimensions, validate_weights
+
+log = logging.getLogger("chargesense.recommendation")
+
+SCORED_FILE = "scored_candidates.csv"
 
 
-def recommend_locations(csv_file, n_clusters=5):
-    # Read CSV
+# ---------------------------------------------------------------- slow half
+def build_scored_table(
+    city: str = DEFAULT_CITY,
+    n_clusters: int = DEFAULT_N_CLUSTERS,
+    use_cache: bool = True,
+    refresh: bool = False,
+) -> pd.DataFrame:
+    """
+    Everything about a city's candidates that does not depend on weights.
+
+    Returns one row per candidate carrying its coordinates, cluster, raw
+    feature distances, feasibility verdict and the six dimension scores.
+    """
+    path = city_dir(city) / SCORED_FILE
+    if use_cache and not refresh and path.exists():
+        table = pd.read_csv(path)
+        log.info("[%s] loaded %d scored candidates from cache", city, len(table))
+        return table
+
+    candidates = candidate_locations.load(city, regenerate=refresh)
+    log.info("[%s] %d candidates", city, len(candidates))
+
+    features = build_features(city, candidates, use_cache=not refresh)
+    feas = feasibility_mod.assess(city, features)
+    dims = compute_dimensions(features, feas)
+
+    labels, _ = cluster_candidates(features, n_clusters=n_clusters)
+
+    table = pd.concat(
+        [features.reset_index(drop=True), feas.reset_index(drop=True), dims.reset_index(drop=True)],
+        axis=1,
+    )
+    table["cluster"] = labels
+
+    table.to_csv(path, index=False)
+    log.info("[%s] wrote %s", city, path)
+    return table
+
+
+# ---------------------------------------------------------------- fast half
+def select_recommendations(
+    table: pd.DataFrame,
+    weights: dict | None = None,
+    n_recommendations: int = DEFAULT_N_RECOMMENDATIONS,
+    min_spacing_km: float = MIN_RECOMMENDATION_SPACING_KM,
+    min_station_km: float = MIN_DISTANCE_FROM_STATION_KM,
+    reject_below_feasibility: float = FEASIBILITY_REJECT_BELOW,
+) -> pd.DataFrame:
+    """
+    Apply weights and pick the final ranked sites.
+
+    Pipeline, in order:
+        1. drop sites too close to an existing charger (we are siting the
+           NEXT station, not a competitor to one already there)
+        2. drop sites whose land-use conflict is disqualifying
+        3. score with the supplied weights
+        4. select highest-first with a minimum separation between picks
+        5. rank and explain
+    """
+    from scoring import apply_weights
+
+    w = validate_weights(weights or DEFAULT_WEIGHTS)
+    df = table.copy()
+    started = len(df)
+
+    if "km_to_station" in df.columns:
+        near = df["km_to_station"].to_numpy(dtype=float) < float(min_station_km)
+        near = near & np.isfinite(df["km_to_station"].to_numpy(dtype=float))
+        if near.any():
+            log.info("[filter] %d sites dropped: within %.1f km of an existing charger",
+                     int(near.sum()), min_station_km)
+        df = df[~near]
+
+    if "feasibility_score" in df.columns:
+        unfit = df["feasibility_score"].to_numpy(dtype=float) < float(reject_below_feasibility)
+        if unfit.any():
+            log.info("[filter] %d sites dropped: land-use conflict", int(unfit.sum()))
+        df = df[~unfit]
+
+    df = df.reset_index(drop=True)
+    if df.empty:
+        log.warning("[filter] no candidates survived filtering")
+        return _empty_result()
+
+    df["overall_score"] = apply_weights(df, w)
+
+    chosen = select_spaced(
+        df["latitude"].to_numpy(dtype=float),
+        df["longitude"].to_numpy(dtype=float),
+        df["overall_score"].to_numpy(dtype=float),
+        min_km=min_spacing_km,
+        limit=int(n_recommendations),
+    )
+
+    out = df.iloc[chosen].reset_index(drop=True)
+    out["rank"] = np.arange(1, len(out) + 1)
+    out["reason"] = explain_frame(out, w)
+    out["nearest_landmark"] = out.apply(primary_landmark, axis=1)
+
+    log.info(
+        "[select] %d candidates -> %d after filtering -> %d ranked sites",
+        started, len(df), len(out),
+    )
+    return out
+
+
+def _empty_result() -> pd.DataFrame:
+    cols = [
+        "latitude", "longitude", "cluster", "overall_score", "rank", "reason",
+        "feasibility_score", "feasibility_band", "conflicts",
+        "demand", "traffic_access", "poi", "coverage_gap", "road_access",
+        "km_to_station", "nearest_landmark",
+    ]
+    return pd.DataFrame(columns=cols)
+
+
+# ---------------------------------------------------------------- full run
+def recommend(
+    city: str = DEFAULT_CITY,
+    weights: dict | None = None,
+    n_clusters: int = DEFAULT_N_CLUSTERS,
+    n_recommendations: int = DEFAULT_N_RECOMMENDATIONS,
+    refresh: bool = False,
+    with_addresses: bool = False,
+) -> pd.DataFrame:
+    """End-to-end for one city. Convenience wrapper over the two halves."""
+    table = build_scored_table(city, n_clusters=n_clusters, refresh=refresh)
+    result = select_recommendations(
+        table, weights=weights, n_recommendations=n_recommendations
+    )
+
+    if with_addresses and not result.empty:
+        from geocoding import resolve_addresses, short_address
+
+        addresses = resolve_addresses(
+            city, result["latitude"], result["longitude"], use_network=True
+        )
+        result["address"] = [short_address(a) for a in addresses]
+
+    return result
+
+
+def attach_cached_addresses(city: str, result: pd.DataFrame) -> pd.DataFrame:
+    """Fill the address column from cache only — never hits the network."""
+    from geocoding import resolve_addresses, short_address
+
+    if result.empty:
+        return result
+    addresses = resolve_addresses(
+        city, result["latitude"], result["longitude"], use_network=False
+    )
+    result = result.copy()
+    result["address"] = [short_address(a) for a in addresses]
+    return result
+
+
+# ---------------------------------------------------------------- legacy API
+def recommend_locations(csv_file, n_clusters: int = 3):
+    """
+    Backwards-compatible entry point.
+
+    The original signature, kept working so existing scripts and teammates'
+    code do not break. It clusters the given CSV and returns
+    (clustered_dataframe, cluster_centers) exactly as before.
+
+    New code should call `recommend()` instead — this path has no scoring,
+    feasibility or explanation.
+    """
     data = pd.read_csv(csv_file)
-    # Load existing EV charging stations from OpenStreetMap
-    city = "Chennai, Tamil Nadu, India"
-    stations = ox.features_from_place(
-        city,
-        {"amenity": "charging_station"}
-    )
-
-    # Candidate coordinates
-    X = data[["latitude", "longitude"]]
-
-    # Cluster candidate locations
-    model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    data["Cluster"] = model.fit_predict(X)
-
-    # -------- Recommendation Features using OpenStreetMap --------
-    feature_queries = {
-        "MallScore": {"shop": "mall"},
-        "HospitalScore": {"amenity": "hospital"},
-        "BusTerminalScore": {"amenity": "bus_station"},
-        "RailwayScore": {"railway": "station"},
-        "MetroScore": {"railway": "station", "station": "subway"},
-        "ITParkScore": {
-            "office": True,
-            "building": "office"
-        },
-        "CommercialScore": {
-            "landuse": "commercial"
-        },
-        "CompanyScore": {
-            "office": "company"
-        },
-        "TrafficScore": {
-            "highway": True
-        },
-    }
-
-    candidate_coords = np.radians(
-        data[["latitude", "longitude"]].to_numpy()
-    )
-
-    for score_name, tags in feature_queries.items():
-        try:
-            pois = ox.features_from_place(city, tags)
-
-            # Convert polygons to centroids using a projected CRS to avoid
-            # geographic CRS centroid warnings.
-            if not pois.empty:
-                pois = pois.copy()
-                projected = pois.to_crs(epsg=32644)  # UTM zone covering Chennai
-                projected["geometry"] = projected.geometry.centroid
-                pois = projected.to_crs(epsg=4326)
-
-            poi_coords = np.radians(
-                np.array([[g.y, g.x] for g in pois.geometry])
-            )
-
-            tree = BallTree(poi_coords, metric="haversine")
-            dist, _ = tree.query(candidate_coords, k=1)
-
-            dist_km = dist.flatten() * 6371
-            score = 1 / (1 + dist_km)
-
-            if score_name == "TrafficScore":
-                road_weights = {
-                    "motorway": 1.0,
-                    "trunk": 0.9,
-                    "primary": 0.8,
-                    "secondary": 0.65,
-                    "tertiary": 0.5,
-                    "residential": 0.3,
-                    "service": 0.2,
-                }
-
-                if "highway" in pois.columns:
-                    weights = pois["highway"].map(road_weights).fillna(0.4)
-                    score = score * weights.mean()
-
-            data[score_name] = score
-
-        except Exception:
-            data[score_name] = 0
-
-    cluster_sizes = data["Cluster"].value_counts()
-    data["RoadConnectivity"] = data["Cluster"].map(cluster_sizes)
-    data["RoadConnectivity"] = (
-        data["RoadConnectivity"] /
-        data["RoadConnectivity"].max()
-    )
-
-    centers = model.cluster_centers_
-    distances = []
-
-    for _, row in data.iterrows():
-        center = centers[int(row["Cluster"])]
-        d = ((row["latitude"] - center[0]) ** 2 +
-             (row["longitude"] - center[1]) ** 2) ** 0.5
-        distances.append(d)
-
-    scaler = MinMaxScaler()
-    data["DistanceScore"] = scaler.fit_transform(pd.DataFrame(distances))
-    data["DistanceScore"] = 1 - data["DistanceScore"]
-
-    data["RecommendationScore"] = (
-        0.18 * data["DistanceScore"] +
-        0.10 * data["RoadConnectivity"] +
-        0.12 * data["MallScore"] +
-        0.10 * data["HospitalScore"] +
-        0.10 * data["MetroScore"] +
-        0.08 * data["RailwayScore"] +
-        0.05 * data["BusTerminalScore"] +
-        0.10 * data["ITParkScore"] +
-        0.05 * data["CommercialScore"] +
-        0.05 * data["CompanyScore"] +
-        0.07 * data["TrafficScore"]
-    )
-
-    data["RecommendationScore"] = scaler.fit_transform(
-        data[["RecommendationScore"]]
-    )
-
-    # Remove duplicate coordinates
-    data = data.drop_duplicates(subset=["latitude", "longitude"])
-    # Remove candidate locations that are too close to existing charging stations
-    if not stations.empty:
-        station_coords = np.radians(
-            stations.geometry.apply(lambda g: [g.y, g.x]).tolist()
-        )
-
-        station_tree = BallTree(
-            station_coords,
-            metric="haversine"
-        )
-
-        candidate_coords = np.radians(
-            data[["latitude", "longitude"]].to_numpy()
-        )
-
-        min_distance_km = 2.0
-        radius = min_distance_km / 6371.0
-
-        keep_rows = []
-
-        for i, coord in enumerate(candidate_coords):
-            nearby = station_tree.query_radius([coord], r=radius)[0]
-            if len(nearby) == 0:
-                keep_rows.append(i)
-
-        data = data.iloc[keep_rows].reset_index(drop=True)
-
-    # Remove candidate locations that are too close to each other (minimum 1 km)
-    coords = np.radians(data[["latitude", "longitude"]].to_numpy())
-    tree = BallTree(coords, metric="haversine")
-
-    keep_indices = []
-    visited = set()
-
-    radius = 1.0 / 6371.0  # 1 km in radians
-
-    for i, point in enumerate(coords):
-        if i in visited:
-            continue
-
-        keep_indices.append(i)
-        neighbors = tree.query_radius([point], r=radius)[0]
-
-        for n in neighbors:
-            if n != i:
-                visited.add(int(n))
-
-    data = data.iloc[keep_indices].reset_index(drop=True)
-
-    # Select recommendations while enforcing minimum spacing
-    data = data.sort_values(
-        "RecommendationScore", ascending=False
-    ).reset_index(drop=True)
-
-    selected = []
-    min_distance_km = 2.0
-
-    for _, row in data.iterrows():
-        keep = True
-
-        for chosen in selected:
-            d = ((row["latitude"] - chosen["latitude"]) ** 2 +
-                 (row["longitude"] - chosen["longitude"]) ** 2) ** 0.5 * 111
-
-            if d < min_distance_km:
-                keep = False
-                break
-
-        if keep:
-            selected.append(row)
-
-        if len(selected) >= 50:
-            break
-
-    data = pd.DataFrame(selected).reset_index(drop=True)
-
-    def build_reason(row):
-        reasons = []
-
-        if row["RoadConnectivity"] >= 0.70:
-            reasons.append("excellent road connectivity")
-
-        if row["TrafficScore"] >= 0.60:
-            reasons.append("high traffic area")
-
-        if row["ITParkScore"] >= 0.60:
-            reasons.append("near an IT park")
-
-        if row["MetroScore"] >= 0.60:
-            reasons.append("close to a metro station")
-
-        if row["RailwayScore"] >= 0.60:
-            reasons.append("near a railway station")
-
-        if row["MallScore"] >= 0.60:
-            reasons.append("close to a shopping mall")
-
-        if row["HospitalScore"] >= 0.60:
-            reasons.append("good access to hospitals")
-
-        if row["CommercialScore"] >= 0.60:
-            reasons.append("located in a commercial area")
-
-        if row["CompanyScore"] >= 0.60:
-            reasons.append("near corporate offices")
-
-        if row["DistanceScore"] >= 0.60:
-            reasons.append("well separated from existing charging stations")
-
-        if not reasons:
-            return "Balanced location with good overall accessibility and infrastructure."
-
-        sentence = ", ".join(reasons[:-1])
-        if len(reasons) > 1:
-            sentence += " and " + reasons[-1]
-        else:
-            sentence = reasons[0]
-
-        return "Recommended because it has " + sentence + "."
-
-    data["Recommendation"] = data.apply(build_reason, axis=1)
-    data["Rank"] = data.index + 1
-
+    labels, centers = cluster_candidates(data, n_clusters=n_clusters)
+    data = data.copy()
+    data["Cluster"] = labels
     return data, centers
 
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    df = recommend()
+    print(df[["rank", "latitude", "longitude", "overall_score", "reason"]].head(10).to_string(index=False))
